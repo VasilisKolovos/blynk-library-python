@@ -80,6 +80,10 @@ class BlynkProtocol(EventEmitter):
         self.state = DISCONNECTED
         self.connect()
 
+    def connState(self):
+        return self.state
+
+
     def virtual_write(self, pin, *val):
         self._send(MSG_HW, 'vw', pin, *val)
 
