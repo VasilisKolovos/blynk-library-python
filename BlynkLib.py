@@ -209,61 +209,91 @@ class BlynkProtocol(EventEmitter):
                     return self.disconnect()
 
 import socket
+import ssl
+import re
+
+ALLOWED_HOST = re.compile(
+    r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)?blynk\.cloud$',
+    re.IGNORECASE | re.ASCII
+)
+ALLOWED_PORTS = (443, 9443)
+CONNECT_TIMEOUT = 10
 
 class Blynk(BlynkProtocol):
     def __init__(self, auth, **kwargs):
-        self.insecure = kwargs.pop('insecure', False)
+        if kwargs.pop('insecure', False):
+            raise ValueError("insecure mode is disabled in this build")
+        self.conn = None
         self.server = kwargs.pop('server', 'blynk.cloud')
-        self.port = kwargs.pop('port', 80 if self.insecure else 443)
+        self.port = kwargs.pop('port', 443)
+        self._check_target(self.server, self.port)
+
+        self.ctx = ssl.create_default_context()
+        self.ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        self.ctx.check_hostname = True
+        self.ctx.verify_mode = ssl.CERT_REQUIRED
+
         BlynkProtocol.__init__(self, auth, **kwargs)
         self.on('redirect', self.redirect)
 
+    @staticmethod
+    def _check_target(server, port):
+        if not isinstance(server, str) or not ALLOWED_HOST.match(server.lower()):
+            raise ValueError("server not allowed: %r" % (server,))
+        if int(port) not in ALLOWED_PORTS:
+            raise ValueError("port not allowed: %r" % (port,))
+
+    def _close_conn(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+    def disconnect(self):
+        self._close_conn()
+        BlynkProtocol.disconnect(self)
+
     def redirect(self, server, port):
-        self.server = server
-        self.port = port
+        try:
+            self._check_target(server, port)
+        except ValueError as e:
+            print("Rejected redirect:", e)
+            self.disconnect()
+            return
+        self.server = server.lower()
+        self.port = int(port)
         self.disconnect()
         self.connect()
 
     def connect(self):
-        print('Connecting to %s:%d...' % (self.server, self.port))
-        s = socket.socket()
-        s.connect(socket.getaddrinfo(self.server, self.port)[0][-1])
+        self._close_conn()
+        print('Connecting to %s:%d (TLS)...' % (self.server, self.port))
+        s = socket.create_connection((self.server, self.port), timeout=CONNECT_TIMEOUT)
         try:
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except:
+        except OSError:
             pass
-        if self.insecure:
-            self.conn = s
-        else:
-            try:
-                import ussl
-                ssl_context = ussl
-            except ImportError:
-                import ssl
-                ssl_context = ssl.create_default_context()
-            self.conn = ssl_context.wrap_socket(s, server_hostname=self.server)
         try:
-            self.conn.settimeout(SOCK_TIMEOUT)
-        except:
-            s.settimeout(SOCK_TIMEOUT)
+            self.conn = self.ctx.wrap_socket(s, server_hostname=self.server)
+        except Exception:
+            s.close()
+            raise
+        self.conn.settimeout(SOCK_TIMEOUT)
         BlynkProtocol.connect(self)
 
     def _write(self, data):
-        #print('<', data)
         self.conn.write(data)
-        # TODO: handle disconnect
 
     def run(self):
         data = b''
         try:
             data = self.conn.read(self.buffin)
-            #print('>', data)
         except KeyboardInterrupt:
             raise
-        except socket.timeout:
-            # No data received, call process to send ping messages when needed
+        except (socket.timeout, ssl.SSLWantReadError):
             pass
-        except: # TODO: handle disconnect
+        except Exception:
             return
         self.process(data)
-
